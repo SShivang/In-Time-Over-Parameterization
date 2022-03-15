@@ -196,8 +196,6 @@ class Masking(object):
                 total_nonzero += density_dict[name] * mask.numel()
             print(f"Overall sparsity {total_nonzero / total_params}")
         
-        print("HELLO")
-
         self.apply_mask()
         self.fired_masks = copy.deepcopy(self.masks) # used for ITOP
         # self.print_nonzero_counts()
@@ -244,7 +242,6 @@ class Masking(object):
         self.remove_type(nn.BatchNorm1d)
         self.init(mode=sparse_init, density=density)
         
-        #print("INTIALIZE MODULES ADDED")
 
     def remove_weight(self, name):
         if name in self.masks:
@@ -297,7 +294,6 @@ class Masking(object):
 
 
     def apply_and_reinitialize(self):
-        print("hello")
 
         for initial_module, module in zip(self.initial_modules, self.modules):
             print("in module")
@@ -308,12 +304,12 @@ class Masking(object):
                 
                 if name in self.masks:
                     
-                    print("previous", (tensor.data == 0).sum())
+                    #print("previous", (tensor.data == 0).sum())
 
                     tensor.data = tensor.data*self.masks[name]
                     
-                    print("during", (tensor.data == 0).sum())
-
+                    #print("during", (tensor.data == 0.sum())
+                    
                     invertedMask = torch.add(torch.mul(self.masks[name], -1),1)
                     
                     #print("before", ((invertedMask + self.masks[name])==0).sum(), (self.masks[name] == 0).sum(), (tensor.data==0).sum())
@@ -324,7 +320,7 @@ class Masking(object):
 
                     #tensor.data = tensor.data | initialTensor.data
 
-                    print("after", (tensor.data==0).sum())
+                    #print("after", (tensor.data==0).sum())
 
 
                     # reset momentum
