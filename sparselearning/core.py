@@ -63,6 +63,9 @@ class Masking(object):
 
         self.masks = {}
         self.modules = []
+
+        self.initial_modules = []
+
         self.names = []
         self.optimizer = optimizer
 
@@ -192,6 +195,8 @@ class Masking(object):
 
                 total_nonzero += density_dict[name] * mask.numel()
             print(f"Overall sparsity {total_nonzero / total_params}")
+        
+        print("HELLO")
 
         self.apply_mask()
         self.fired_masks = copy.deepcopy(self.masks) # used for ITOP
@@ -217,14 +222,16 @@ class Masking(object):
         self.steps += 1
 
         if self.prune_every_k_steps is not None:
-            if self.steps % self.prune_every_k_steps == 0:
-                self.truncate_weights()
+            if self.steps % self.prune_every_k_steps == 0:    
+                self.truncate_weights_dense()
                 _, _ = self.fired_masks_update()
                 self.print_nonzero_counts()
 
 
     def add_module(self, module, density, sparse_init='ER'):
         self.modules.append(module)
+        self.initial_modules.append(copy.deepcopy(module))
+
         for name, tensor in module.named_parameters():
             self.names.append(name)
             self.masks[name] = torch.zeros_like(tensor, dtype=torch.float32, requires_grad=False).cuda()
@@ -236,7 +243,8 @@ class Masking(object):
         print('Removing 1D batch norms...')
         self.remove_type(nn.BatchNorm1d)
         self.init(mode=sparse_init, density=density)
-
+        
+        #print("INTIALIZE MODULES ADDED")
 
     def remove_weight(self, name):
         if name in self.masks:
@@ -277,10 +285,48 @@ class Masking(object):
                     self.remove_weight(name)
 
     def apply_mask(self):
-        for module in self.modules:
+        for initial_module, module in zip(self.initial_modules, self.modules):
             for name, tensor in module.named_parameters():
                 if name in self.masks:
                     tensor.data = tensor.data*self.masks[name]
+                    # reset momentum
+                    #print((tensor.data==0).sum())
+
+                    if 'momentum_buffer' in self.optimizer.state[tensor]:
+                        self.optimizer.state[tensor]['momentum_buffer'] = self.optimizer.state[tensor]['momentum_buffer']*self.masks[name]
+
+
+    def apply_and_reinitialize(self):
+        print("hello")
+
+        for initial_module, module in zip(self.initial_modules, self.modules):
+            print("in module")
+            for initialModule, newModule in zip(initial_module.named_parameters(),module.named_parameters()):
+                
+                (name, tensor) = newModule
+                (intialName, initialTensor) = initialModule
+                
+                if name in self.masks:
+                    
+                    print("previous", (tensor.data == 0).sum())
+
+                    tensor.data = tensor.data*self.masks[name]
+                    
+                    print("during", (tensor.data == 0).sum())
+
+                    invertedMask = torch.add(torch.mul(self.masks[name], -1),1)
+                    
+                    #print("before", ((invertedMask + self.masks[name])==0).sum(), (self.masks[name] == 0).sum(), (tensor.data==0).sum())
+
+                    tensor.data = tensor.data + invertedMask*initialTensor.data
+                    
+                    self.masks[name] = self.masks[name] + invertedMask
+
+                    #tensor.data = tensor.data | initialTensor.data
+
+                    print("after", (tensor.data==0).sum())
+
+
                     # reset momentum
                     if 'momentum_buffer' in self.optimizer.state[tensor]:
                         self.optimizer.state[tensor]['momentum_buffer'] = self.optimizer.state[tensor]['momentum_buffer']*self.masks[name]
@@ -304,6 +350,7 @@ class Masking(object):
 
                     x, idx = torch.sort(torch.abs(weight.data.view(-1)))
                     p = int(curr_prune_rate * weight.numel())
+
                     self.masks[name].data.view(-1)[idx[:p]] = 0.0
             self.apply_mask()
         total_size = 0
@@ -316,9 +363,11 @@ class Masking(object):
             sparse_size += (weight != 0).sum().int().item()
 
         print('Total parameters under sparsity level of {0}: {1} after epoch of {2}'.format(self.density, sparse_size / total_size, epoch))
+    
+    def truncate_weights_dense(self):
 
-    def truncate_weights(self):
 
+    # get the mask
 
         for module in self.modules:
             for name, weight in module.named_parameters():
@@ -340,6 +389,33 @@ class Masking(object):
                 self.num_remove[name] = int(self.name2nonzeros[name] - new_mask.sum().item())
                 self.masks[name][:] = new_mask
 
+        # apply mask and reinitialize
+
+        self.apply_and_reinitialize()
+    
+    def truncate_weights(self):
+
+        for module in self.modules:
+            for name, weight in module.named_parameters():
+                if name not in self.masks: continue
+                mask = self.masks[name]
+                self.name2nonzeros[name] = mask.sum().item()
+                self.name2zeros[name] = mask.numel() - self.name2nonzeros[name]
+
+                # death
+                if self.death_mode == 'magnitude':
+                    new_mask = self.magnitude_medium_death(mask, weight, name)
+                elif self.death_mode == 'SET':
+                    new_mask = self.magnitude_and_negativity_death(mask, weight, name)
+                elif self.death_mode == 'Taylor_FO':
+                    new_mask = self.taylor_FO(mask, weight, name)
+                elif self.death_mode == 'threshold':
+                    new_mask = self.threshold_death(mask, weight, name)
+
+                self.num_remove[name] = int(self.name2nonzeros[name] - new_mask.sum().item())
+                self.masks[name][:] = new_mask
+
+                print(self.masks[name])
 
         for module in self.modules:
             for name, weight in module.named_parameters():
@@ -364,6 +440,8 @@ class Masking(object):
                 # exchanging masks
                 self.masks.pop(name)
                 self.masks[name] = new_mask.float()
+                
+                print(self.masks[name])
 
         self.apply_mask()
 
@@ -397,6 +475,39 @@ class Masking(object):
 
         k = math.ceil(num_zeros + num_remove)
         threshold = x[k-1].item()
+        
+
+        return (torch.abs(weight.data) < threshold)
+
+    def magnitude_medium_death(self, mask, weight, name):  
+
+        num_remove = math.ceil(self.death_rate*self.name2nonzeros[name])
+        if num_remove == 0.0: return weight.data != 0.0
+        num_zeros = self.name2zeros[name]
+
+        x, idx = torch.sort(torch.abs(weight.data.view(-1)))
+        n = idx.shape[0]
+
+        k = math.ceil(num_zeros + num_remove)
+        
+        k = int(0.5*k)
+
+        low_threshold = x[-k].item()
+        high_threshold = x[k-1].item()
+
+        return (torch.abs(weight.data) < high_threshold) | (torch.abs(weight.data) > low_threshold)
+
+    def magnitude_high_death(self, mask, weight, name):
+
+        num_remove = math.ceil(self.death_rate*self.name2nonzeros[name])
+        if num_remove == 0.0: return weight.data != 0.0
+        num_zeros = self.name2zeros[name]
+
+        x, idx = torch.sort(torch.abs(weight.data.view(-1)))
+        n = idx.shape[0]
+
+        k = math.ceil(num_zeros + num_remove)
+        threshold = x[-k].item()
 
         return (torch.abs(weight.data) > threshold)
 

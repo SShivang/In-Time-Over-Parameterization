@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
-
+import matplotlib.pyplot as plt
 import sparselearning
 from sparselearning.core import Masking, CosineDecay, LinearDecay
 from sparselearning.models import AlexNet, VGG16, LeNet_300_100, LeNet_5_Caffe, WideResNet, MLP_CIFAR10, ResNet34, ResNet18
@@ -106,11 +106,13 @@ def train(args, model, device, train_loader, optimizer, epoch, mask=None):
                 epoch, batch_idx * len(data), len(train_loader)*args.batch_size,
                 100. * batch_idx / len(train_loader), loss.item(), correct, n, 100. * correct / float(n)))
 
-
     # training summary
     print_and_log('\n{}: Average loss: {:.4f}, Accuracy: {}/{} ({:.3f}%)\n'.format(
         'Training summary' ,
         train_loss/batch_idx, correct, n, 100. * correct / float(n)))
+
+
+    return correct / float(n) 
 
 def evaluate(args, model, device, test_loader, is_test_set=False):
     model.eval()
@@ -201,6 +203,7 @@ def main():
             train_loader, valid_loader, test_loader = get_mnist_dataloaders(args, validation_split=args.valid_split)
         elif args.data == 'cifar10':
             train_loader, valid_loader, test_loader = get_cifar10_dataloaders(args, args.valid_split, max_threads=args.max_threads)
+
         elif args.data == 'cifar100':
             train_loader, valid_loader, test_loader = get_cifar100_dataloaders(args, args.valid_split, max_threads=args.max_threads)
         if args.model not in models:
@@ -274,12 +277,17 @@ def main():
 
         best_acc = 0.0
 
+        val_graph = []
+        train_graph = []
+
         for epoch in range(1, args.epochs*args.multiplier + 1):
             t0 = time.time()
-            train(args, model, device, train_loader, optimizer, epoch, mask)
+            train_acc = train(args, model, device, train_loader, optimizer, epoch, mask)
             lr_scheduler.step()
             if args.valid_split > 0.0:
                 val_acc = evaluate(args, model, device, valid_loader)
+                val_graph.append(val_acc)
+                train_graph.append(train_acc)
 
             if val_acc > best_acc:
                 print('Saving model')
@@ -287,6 +295,12 @@ def main():
                 torch.save(model.state_dict(), args.save)
 
             print_and_log('Current learning rate: {0}. Time taken for epoch: {1:.2f} seconds.\n'.format(optimizer.param_groups[0]['lr'], time.time() - t0))
+        
+            plt.plot(val_graph)
+            plt.plot(train_graph)
+
+            plt.savefig("accuracy")
+
         print('Testing model')
         model.load_state_dict(torch.load(args.save))
         evaluate(args, model, device, test_loader, is_test_set=True)
